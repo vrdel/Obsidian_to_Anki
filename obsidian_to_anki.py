@@ -1,3 +1,4 @@
+#!/home/daniel/.pyenv/versions/3.6.15/envs/vrdel-apps-3615/bin/python3
 """Script for adding cards to Anki from Obsidian."""
 
 import re
@@ -274,6 +275,10 @@ class FormatConverter:
     DISPLAY_CODE_REPLACE = "OBSTOANKICODEDISPLAY"
 
     IMAGE_REGEXP = re.compile(r'<img alt=".*?" src="(.*?)"')
+    IMAGE_TAG_REGEXP = re.compile(
+        r"<img\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*>",
+        re.IGNORECASE
+    )
     SOUND_REGEXP = re.compile(r'\[sound:(.+)\]')
     CLOZE_REGEXP = re.compile(
         r'(?:(?<!{){(?:c?(\d+)[:|])?(?!{))((?:[^\n][\n]?)+?)(?:(?<!})}(?!}))'
@@ -410,6 +415,60 @@ class FormatConverter:
             FormatConverter.path_to_filename,
             html_text
         )
+
+    @staticmethod
+    def image_attribute(image_tag, attribute):
+        """Return an image attribute's decoded value, if present."""
+        match = re.search(
+            r"\b{}\s*=\s*([\"'])(.*?)\1".format(re.escape(attribute)),
+            image_tag,
+            re.IGNORECASE | re.DOTALL
+        )
+        if match is None:
+            return None
+        return html.unescape(match.group(2))
+
+    @staticmethod
+    def merge_image_titles(new_html, existing_html):
+        """Preserve Anki-added image titles while replacing a field."""
+        existing_titles = collections.defaultdict(collections.deque)
+        for match in FormatConverter.IMAGE_TAG_REGEXP.finditer(existing_html):
+            image_tag = match.group(0)
+            src = FormatConverter.image_attribute(image_tag, "src")
+            if src is not None:
+                existing_titles[src].append(
+                    FormatConverter.image_attribute(image_tag, "title")
+                )
+
+        def preserve_title(match):
+            image_tag = match.group(0)
+            src = FormatConverter.image_attribute(image_tag, "src")
+            if src is None or not existing_titles[src]:
+                return image_tag
+
+            existing_title = existing_titles[src].popleft()
+            if (
+                existing_title is None
+                or FormatConverter.image_attribute(image_tag, "title")
+                is not None
+            ):
+                return image_tag
+
+            closing_slash = re.search(r"\s*/>$", image_tag)
+            if closing_slash is None:
+                insertion_point = image_tag.rfind(">")
+            else:
+                insertion_point = closing_slash.start()
+            title_attribute = ' title="{}"'.format(
+                html.escape(existing_title, quote=True)
+            )
+            return (
+                image_tag[:insertion_point]
+                + title_attribute
+                + image_tag[insertion_point:]
+            )
+
+        return FormatConverter.IMAGE_TAG_REGEXP.sub(preserve_title, new_html)
 
     @staticmethod
     def fix_audio_src(html_text):
@@ -1402,6 +1461,20 @@ class File:
             ]
         )
 
+    def preserve_anki_image_titles(self):
+        """Merge add-on-generated image titles into fields being updated."""
+        for parsed, note_info in zip(self.notes_to_edit, self.card_ids):
+            existing_fields = note_info.get("fields", {})
+            for field, new_value in parsed.note["fields"].items():
+                existing_field = existing_fields.get(field, {})
+                existing_value = existing_field.get("value", "")
+                parsed.note["fields"][field] = (
+                    FormatConverter.merge_image_titles(
+                        new_value,
+                        existing_value
+                    )
+                )
+
     def get_cards(self):
         """Get the card IDs for all notes that need to be edited."""
         logging.info("Getting card IDs")
@@ -1674,16 +1747,6 @@ class Directory:
                 ]
             )
         )
-        logging.info("Updating fields of existing notes...")
-        requests.append(
-            AnkiConnect.request(
-                "multi",
-                actions=[
-                    file.get_update_fields()
-                    for file in self.files
-                ]
-            )
-        )
         logging.info("Removing empty notes...")
         requests.append(
             AnkiConnect.request(
@@ -1710,6 +1773,7 @@ class Directory:
             ]
         for card_ids, file in zip(cards_ids, self.files):
             file.card_ids = AnkiConnect.parse(card_ids)
+            file.preserve_anki_image_titles()
         for file in self.files:
             file.tags = tags
         os.chdir(self.path)
@@ -1725,6 +1789,16 @@ class Directory:
         """Get 2nd big request."""
         logging.info("Forming request 2 for directory " + self.path)
         requests = list()
+        logging.info("Updating fields of existing notes...")
+        requests.append(
+            AnkiConnect.request(
+                "multi",
+                actions=[
+                    file.get_update_fields()
+                    for file in self.files
+                ]
+            )
+        )
         logging.info("Moving cards to target deck...")
         requests.append(
             AnkiConnect.request(
