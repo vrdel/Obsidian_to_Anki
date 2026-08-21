@@ -1,4 +1,3 @@
-#!/home/daniel/.pyenv/versions/3.6.15/envs/vrdel-apps-3615/bin/python3
 """Script for adding cards to Anki from Obsidian."""
 
 import re
